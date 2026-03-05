@@ -1,0 +1,261 @@
+import boto3
+import json
+from datetime import datetime, timezone
+from botocore.exceptions import ClientError
+
+# ===== Clients =====
+session = boto3.Session()
+s3 = session.client('s3')
+ec2_global = session.client('ec2')
+iam = session.client('iam')
+cloudtrail = session.client('cloudtrail')
+config = session.client('config')
+
+report = {
+    'S3': [],
+    'SecurityGroups': [],
+    'IAM': [],
+    'CloudTrail': [],
+    'AWSConfig': []
+}
+
+dangerous_cidrs = ['0.0.0.0/0', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16']
+danger_ports = [22, 3389, 3306, 5432, 27017]
+
+# ===== Helpers =====
+def analyze_policy(policy_doc):
+    statements = policy_doc.get('Statement', [])
+    if not isinstance(statements, list):
+        statements = [statements]
+    alerts = []
+    for stmt in statements:
+        if stmt.get('Effect') != 'Allow':
+            continue
+        actions = stmt.get('Action')
+        resources = stmt.get('Resource')
+        if actions == '*' or (isinstance(actions, list) and '*' in actions):
+            alerts.append(f'ALL actions on {resources}')
+        if resources == '*' or (isinstance(resources, list) and '*' in resources):
+            alerts.append(f'ALL resources')
+    return alerts
+
+def check_s3():
+    try:
+        buckets = s3.list_buckets()['Buckets']
+    except ClientError as e:
+        print("Error listing S3 buckets:", e)
+        return
+
+    for bucket in buckets:
+        name = bucket['Name']
+        s3_item = {'Name': name, 'Public': False, 'Encryption': None, 'Versioning': None}
+
+        # Check ACL
+        try:
+            acl = s3.get_bucket_acl(Bucket=name)
+            for grant in acl['Grants']:
+                if grant['Grantee'].get('URI') == 'http://acs.amazonaws.com/groups/global/AllUsers':
+                    s3_item['Public'] = True
+        except ClientError:
+            pass
+
+        # Check Policy
+        try:
+            policy_status = s3.get_bucket_policy_status(Bucket=name)
+            if policy_status['PolicyStatus']['IsPublic']:
+                s3_item['Public'] = True
+        except ClientError:
+            pass
+
+        # Check Block Public Access
+        try:
+            block = s3.get_public_access_block(Bucket=name)
+            cfg = block['PublicAccessBlockConfiguration']
+            if not all(cfg.values()):
+                s3_item['Public'] = True
+        except ClientError:
+            pass
+
+        # Encryption
+        try:
+            enc = s3.get_bucket_encryption(Bucket=name)
+            rules = enc['ServerSideEncryptionConfiguration']['Rules']
+            s3_item['Encryption'] = [r['ApplyServerSideEncryptionByDefault']['SSEAlgorithm'] for r in rules]
+        except ClientError:
+            s3_item['Encryption'] = 'Not enabled'
+
+        # Versioning
+        try:
+            ver = s3.get_bucket_versioning(Bucket=name)
+            s3_item['Versioning'] = ver.get('Status', 'Disabled')
+        except ClientError:
+            s3_item['Versioning'] = 'Unknown'
+
+        report['S3'].append(s3_item)
+
+
+def check_security_groups():
+    try:
+        regions = ec2_global.describe_regions()['Regions']
+    except ClientError as e:
+        print("Error describing regions:", e)
+        return
+
+    for region in regions:
+        region_name = region['RegionName']
+        ec2 = boto3.client('ec2', region_name=region_name)
+        try:
+            groups = ec2.describe_security_groups()['SecurityGroups']
+        except ClientError:
+            continue
+
+        for sg in groups:
+            sg_item = {'GroupName': sg['GroupName'], 'GroupId': sg['GroupId'], 'Region': region_name, 'OpenPorts': []}
+
+            for perm_type in ['IpPermissions', 'IpPermissionsEgress']:
+                perms = sg.get(perm_type, [])
+                for perm in perms:
+                    from_port = perm.get('FromPort')
+                    to_port = perm.get('ToPort')
+                    # IPv4 ranges
+                    for ip_range in perm.get('IpRanges', []):
+                        cidr = ip_range.get('CidrIp')
+                        if cidr in dangerous_cidrs:
+                            severity = 'High' if from_port in danger_ports or from_port is None else 'Medium'
+                            sg_item['OpenPorts'].append({'Type': 'Ingress' if perm_type=='IpPermissions' else 'Egress',
+                                                        'FromPort': from_port, 'ToPort': to_port,
+                                                        'CIDR': cidr, 'Severity': severity})
+                    # IPv6 ranges
+                    for ip_range in perm.get('Ipv6Ranges', []):
+                        cidr = ip_range.get('CidrIpv6')
+                        sg_item['OpenPorts'].append({'Type': 'Ingress' if perm_type=='IpPermissions' else 'Egress',
+                                                    'FromPort': from_port, 'ToPort': to_port,
+                                                    'CIDR': cidr, 'Severity': 'Medium'})
+                    # Prefix lists
+                    for prefix in perm.get('PrefixListIds', []):
+                        sg_item['OpenPorts'].append({'Type': 'Ingress' if perm_type=='IpPermissions' else 'Egress',
+                                                    'FromPort': from_port, 'ToPort': to_port,
+                                                    'CIDR': prefix.get('PrefixListId'), 'Severity': 'Medium'})
+
+            report['SecurityGroups'].append(sg_item)
+
+
+def check_iam():
+    # Users
+    paginator = iam.get_paginator('list_users')
+    for page in paginator.paginate():
+        for user in page['Users']:
+            user_name = user['UserName']
+            user_item = {'UserName': user_name, 'Alerts': [], 'MFA': False}
+
+            # MFA
+            try:
+                mfa_devices = iam.list_mfa_devices(UserName=user_name)['MFADevices']
+                if mfa_devices:
+                    user_item['MFA'] = True
+            except ClientError:
+                pass
+
+            # Inline policies
+            try:
+                for pol_name in iam.list_user_policies(UserName=user_name)['PolicyNames']:
+                    doc = iam.get_user_policy(UserName=user_name, PolicyName=pol_name)['PolicyDocument']
+                    user_item['Alerts'].extend(analyze_policy(doc))
+            except ClientError:
+                pass
+
+            # Managed policies
+            try:
+                for pol in iam.list_attached_user_policies(UserName=user_name)['AttachedPolicies']:
+                    if 'AdministratorAccess' in pol['PolicyName']:
+                        user_item['Alerts'].append('AdministratorAccess attached')
+            except ClientError:
+                pass
+
+            report['IAM'].append(user_item)
+
+    # Roles
+    paginator = iam.get_paginator('list_roles')
+    for page in paginator.paginate():
+        for role in page['Roles']:
+            role_name = role['RoleName']
+            role_item = {'RoleName': role_name, 'Alerts': []}
+
+            # Inline policies
+            try:
+                for pol_name in iam.list_role_policies(RoleName=role_name)['PolicyNames']:
+                    doc = iam.get_role_policy(RoleName=role_name, PolicyName=pol_name)['PolicyDocument']
+                    role_item['Alerts'].extend(analyze_policy(doc))
+            except ClientError:
+                pass
+
+            # Managed policies
+            try:
+                for pol in iam.list_attached_role_policies(RoleName=role_name)['AttachedPolicies']:
+                    if 'AdministratorAccess' in pol['PolicyName']:
+                        role_item['Alerts'].append('AdministratorAccess attached')
+            except ClientError:
+                pass
+
+            report['IAM'].append(role_item)
+
+
+def check_cloudtrail():
+    try:
+        trails = cloudtrail.describe_trails()['trailList']
+    except ClientError:
+        trails = []
+
+    for trail in trails:
+        name = trail['Name']
+        try:
+            status = cloudtrail.get_trail_status(Name=name)
+        except ClientError:
+            status = {'IsLogging': False}
+
+        trail_item = {
+            'Name': name,
+            'Logging': status.get('IsLogging', False),
+            'MultiRegion': trail.get('IsMultiRegionTrail', False),
+            'LogValidation': trail.get('LogFileValidationEnabled', False)
+        }
+        report['CloudTrail'].append(trail_item)
+
+
+def check_config():
+    try:
+        configs = config.describe_configuration_recorders()['ConfigurationRecorders']
+    except ClientError:
+        configs = []
+
+    if not configs:
+        report['AWSConfig'].append({'Status': 'Not configured'})
+    else:
+        for recorder in configs:
+            try:
+                delivery_channels = config.describe_delivery_channels()['DeliveryChannels']
+            except ClientError:
+                delivery_channels = []
+            report['AWSConfig'].append({'Recorder': recorder['name'], 'DeliveryChannels': delivery_channels})
+
+
+# ===== Main Execution =====
+check_s3()
+check_security_groups()
+check_iam()
+check_cloudtrail()
+check_config()
+
+# ===== Output =====
+timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+filename = f'aws_audit_report_{timestamp}.json'
+with open(filename, 'w') as f:
+    json.dump(report, f, indent=4)
+
+# ===== Console Summary =====
+print(f"AWS Audit completed. Report saved as {filename}")
+print(f"S3 Buckets Checked: {len(report['S3'])}")
+print(f"Security Groups Checked: {len(report['SecurityGroups'])}")
+print(f"IAM Users/Roles Checked: {len(report['IAM'])}")
+print(f"CloudTrail Trails: {len(report['CloudTrail'])}")
+print(f"AWS Config Recorders: {len(report['AWSConfig'])}")
